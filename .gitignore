@@ -1,0 +1,21 @@
+# Credentials (never commit)
+.env
+
+# Python virtual environment
+.venv/
+
+# Generated output files
+output/
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tenant-specific files
+rex-simulation-*.md
