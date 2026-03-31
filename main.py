@@ -3,6 +3,7 @@
 from config import get_mdlh_catalog, ATLAN_TENANT, DATA_DIR, OUTPUT_DIR
 from metadata_extractor import extract_metadata
 from asset_scorer import run_scorer
+from context_writer_v2 import run_context_writer_v2
 
 
 def find_entity_namespace(namespaces):
@@ -28,6 +29,7 @@ def main():
 
     asset_index, all_edges = extract_metadata(catalog, ns, ATLAN_TENANT)
     run_scorer(asset_index, all_edges, ATLAN_TENANT, DATA_DIR, OUTPUT_DIR)
+    run_context_writer_v2(asset_index, ATLAN_TENANT, OUTPUT_DIR)
 
 
 if __name__ == "__main__":

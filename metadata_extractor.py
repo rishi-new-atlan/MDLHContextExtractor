@@ -532,6 +532,29 @@ def build_glossary_edges(asset_index):
     return edges
 
 
+def resolve_glossary_uuids(asset_index):
+    """Replace UUID strings in glossary_terms lists with resolved term names."""
+    _p("\n[+] Resolving glossary term UUIDs...")
+    t0 = time.time()
+    guid_to_name = {
+        guid: a.name for guid, a in asset_index.items()
+        if a.asset_type == "GlossaryTerm" and a.name
+    }
+    resolved_count = 0
+    for asset in asset_index.values():
+        if not asset.glossary_terms:
+            continue
+        new_terms = []
+        for term in asset.glossary_terms:
+            if term in guid_to_name:
+                new_terms.append(guid_to_name[term])
+                resolved_count += 1
+            else:
+                new_terms.append(term)
+        asset.glossary_terms = new_terms
+    _p(f"  Resolved {resolved_count:,} UUID references in {time.time()-t0:.1f}s")
+
+
 def extract_metadata(catalog, ns, tenant):
     t_total = time.time()
     _p(f"\n{'='*60}")
@@ -545,6 +568,7 @@ def extract_metadata(catalog, ns, tenant):
     tc_edges       = build_table_column_edges(asset_index)
     lineage_edges  = build_lineage_edges(catalog, ns, asset_index)
     glossary_edges = build_glossary_edges(asset_index)
+    resolve_glossary_uuids(asset_index)
 
     all_edges = tag_edges + cm_edges + tc_edges + lineage_edges + glossary_edges
     _p(f"\nExtraction complete: {len(asset_index):,} assets, {len(all_edges):,} edges in {time.time()-t_total:.1f}s")
