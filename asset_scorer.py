@@ -23,21 +23,23 @@ def _p(msg):
 # Config — tune per tenant
 # ---------------------------------------------------------------------------
 WEIGHTS = {
-    "readme":               3,   # richest signal
-    "description":          2,
-    "custom_metadata":      2,   # 1–2 attributes; 3+ bumps to 3
-    "custom_metadata_rich": 3,   # ≥3 custom metadata attributes
-    "lineage":              2,
-    "tags":                 1,
-    "glossary_terms":       1,
-    "documented_columns":   1,   # table has ≥1 column with a description
-    "certificate_verified": 3,   # VERIFIED — strongest trust signal
-    "certificate_draft":    1,   # DRAFT — some curation intent
-    "is_view":              1,   # View / MaterialisedView — curated/derived assets
+    "readme":                    3,   # richest text signal
+    "description":               2,
+    "custom_metadata":           3,   # 1–2 CM attributes
+    "custom_metadata_rich":      4,   # 3–9 CM attributes
+    "custom_metadata_very_rich": 5,   # ≥10 CM attributes — richest signal
+    "lineage":                   2,
+    "tags":                      1,
+    "glossary_terms":            1,
+    "documented_columns":        1,   # table has ≥1 column with a description
+    "documented_columns_cm":     1,   # table has ≥1 column with custom metadata
+    "certificate_verified":      3,   # VERIFIED — strongest trust signal
+    "certificate_draft":         1,   # DRAFT — some curation intent
+    "is_view":                   1,   # View / MaterialisedView — curated/derived assets
 }
 
-ALWAYS_INCLUDE_TYPES = {"GlossaryTerm", "DataProduct", "DataDomain"}
-EXCLUDE_BARE_COLUMNS  = True   # drop columns that have no description
+ALWAYS_INCLUDE_TYPES = {"GlossaryTerm", "DataProduct", "DataDomain", "CustomEntity"}
+EXCLUDE_BARE_COLUMNS  = True   # drop columns with no description AND no custom metadata
 MIN_SCORE             = 2      # minimum richness score to include
 TOP_N                 = 5000   # cap on assets written to context.txt
 # ---------------------------------------------------------------------------
@@ -56,12 +58,14 @@ def score_asset(asset: dict) -> tuple:
     breakdown = {
         "readme":               WEIGHTS["readme"]               if asset.get("readme")          else 0,
         "description":          WEIGHTS["description"]          if asset.get("description")     else 0,
-        "custom_metadata":      WEIGHTS["custom_metadata_rich"] if cm_count >= 3
-                                else (WEIGHTS["custom_metadata"] if cm_count > 0 else 0),
+        "custom_metadata":      WEIGHTS["custom_metadata_very_rich"] if cm_count >= 10
+                                else (WEIGHTS["custom_metadata_rich"] if cm_count >= 3
+                                else (WEIGHTS["custom_metadata"] if cm_count > 0 else 0)),
         "lineage":              WEIGHTS["lineage"]              if (asset.get("lineage_upstream") or asset.get("lineage_downstream")) else 0,
         "tags":                 WEIGHTS["tags"]                 if asset.get("tags")            else 0,
         "glossary_terms":       WEIGHTS["glossary_terms"]       if asset.get("glossary_terms")  else 0,
         "documented_columns":   WEIGHTS["documented_columns"]   if any(c.get("description") for c in asset.get("columns", [])) else 0,
+        "documented_columns_cm": WEIGHTS["documented_columns_cm"] if any(c.get("custom_metadata") for c in asset.get("columns", [])) else 0,
         "certificate_verified": WEIGHTS["certificate_verified"] if cert == "VERIFIED"           else 0,
         "certificate_draft":    WEIGHTS["certificate_draft"]    if cert == "DRAFT"              else 0,
         "is_view":              WEIGHTS["is_view"]              if atype in ("View", "MaterialisedView") else 0,
@@ -137,7 +141,7 @@ def run_scorer(asset_index: dict, all_edges: list, tenant: str, data_dir: Path, 
         a = asdict(asset) if hasattr(asset, "__dataclass_fields__") else asset
         atype = a.get("asset_type", "")
 
-        if EXCLUDE_BARE_COLUMNS and atype == "Column" and not a.get("description"):
+        if EXCLUDE_BARE_COLUMNS and atype == "Column" and not a.get("description") and not a.get("custom_metadata"):
             skipped += 1
             continue
 

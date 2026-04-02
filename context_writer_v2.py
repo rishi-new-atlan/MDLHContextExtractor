@@ -1,7 +1,7 @@
 """
 context_writer_v2.py
 
-Structured 11-section context output optimized for Rex simulation scenario generation.
+Structured 12-section context output optimized for Rex simulation scenario generation.
 Does NOT modify asset_scorer.py — keeps it as fallback.
 """
 
@@ -212,7 +212,7 @@ TABLE_TYPES = {"Table", "View", "MaterialisedView"}
 
 
 def build_context_data(asset_index: dict) -> dict:
-    """Classify, enrich and precompute all data needed by the 11 sections."""
+    """Classify, enrich and precompute all data needed by the 12 sections."""
     _p("\n[Context Writer v2] Precomputing context data...")
     t0 = time.time()
 
@@ -229,6 +229,7 @@ def build_context_data(asset_index: dict) -> dict:
     data_products = {}
     domains = {}
     columns_raw = {}
+    custom_entities = {}
     other = {}
 
     for guid, a in assets.items():
@@ -243,6 +244,8 @@ def build_context_data(asset_index: dict) -> dict:
             domains[guid] = a
         elif atype == "Column":
             columns_raw[guid] = a
+        elif atype == "CustomEntity":
+            custom_entities[guid] = a
         else:
             other[guid] = a
 
@@ -304,6 +307,18 @@ def build_context_data(asset_index: dict) -> dict:
         if "granular" in k.lower() and "access" in k.lower():
             ubiquitous_cm.add(k)
 
+    # Custom Entity CM schema summaries
+    ce_cm_schemas = defaultdict(lambda: {"count": 0, "attributes": defaultdict(lambda: Counter())})
+    for ce in custom_entities.values():
+        for cm in ce.get("custom_metadata") or []:
+            schema_name = cm.get("set", "")
+            attr_name = cm.get("attribute", "")
+            val = cm.get("value", "")
+            if schema_name:
+                ce_cm_schemas[schema_name]["count"] += 1
+                if attr_name:
+                    ce_cm_schemas[schema_name]["attributes"][attr_name][val] += 1
+
     # Glossary → linked tables reverse mapping
     term_to_tables = defaultdict(list)
     for guid, t in tables.items():
@@ -337,7 +352,8 @@ def build_context_data(asset_index: dict) -> dict:
     tables_with_glossary = sum(1 for t in tables.values() if t.get("glossary_terms"))
 
     _p(f"  Tables: {total_tables:,} | Glossary: {len(glossary_terms):,} | "
-        f"Products: {len(data_products):,} | Domains: {len(domains):,}")
+        f"Products: {len(data_products):,} | Domains: {len(domains):,} | "
+        f"CustomEntities: {len(custom_entities):,}")
     _p(f"  Precomputation done in {time.time()-t0:.1f}s")
 
     return {
@@ -346,6 +362,8 @@ def build_context_data(asset_index: dict) -> dict:
         "glossary_terms": glossary_terms,
         "data_products": data_products,
         "domains": domains,
+        "custom_entities": custom_entities,
+        "ce_cm_schemas": dict(ce_cm_schemas),
         "tag_groups": tag_groups,
         "tag_definitions": tag_definitions,
         "owner_tables": owner_tables,
@@ -380,7 +398,8 @@ def write_section_1_header(f, ctx: dict, tenant: str):
     f.write(f"Total Tables/Views: {total:,}\n")
     f.write(f"Glossary Terms: {len(ctx['glossary_terms']):,}\n")
     f.write(f"Data Products: {len(ctx['data_products']):,}\n")
-    f.write(f"Data Domains: {len(ctx['domains']):,}\n\n")
+    f.write(f"Data Domains: {len(ctx['domains']):,}\n")
+    f.write(f"Custom Entities: {len(ctx['custom_entities']):,}\n\n")
 
     f.write("### Layer Distribution\n")
     for layer in ["Business", "Enriched", "Trusted", "Landing", "Unknown"]:
@@ -782,44 +801,102 @@ def write_section_9_enriched(f, ctx: dict):
         f.write("\n")
 
 
+def _has_meaningful_metadata(t: dict) -> bool:
+    """Check if a table has CM, real description, tags, or glossary terms."""
+    if t.get("custom_metadata"):
+        return True
+    desc = t.get("description", "")
+    if desc and not is_placeholder_description(desc):
+        return True
+    if t.get("tags"):
+        return True
+    gterms = t.get("glossary_terms") or []
+    if any(not _UUID_RE.match(g) for g in gterms):
+        return True
+    return False
+
+
+def _write_table_condensed_cm(f, t: dict, ubiquitous_cm: set):
+    """Compact enriched block for a table with CM/desc/tags/glossary/owners."""
+    name = t.get("name", "")
+    lifecycle = f" [{t['_lifecycle']}]" if t.get("_lifecycle") else ""
+    cert = t.get("certificate_status", "")
+    cert_str = f" [{cert}]" if cert else ""
+
+    f.write(f"**{name}**{lifecycle}{cert_str}\n")
+
+    desc = t.get("description", "")
+    if desc and not is_placeholder_description(desc):
+        f.write(f"  Description: {_clean_html(desc)}\n")
+
+    cm = t.get("custom_metadata") or []
+    if cm:
+        formatted = format_custom_metadata(cm, ubiquitous_cm)
+        if formatted:
+            f.write(f"  Custom Metadata: {'; '.join(formatted)}\n")
+
+    tags = t.get("tags") or []
+    if tags:
+        tag_strs = []
+        for tag in tags:
+            ttype, tval = parse_tag(tag)
+            tag_strs.append(f"{ttype}: {tval}" if tval else ttype)
+        f.write(f"  Tags: {', '.join(tag_strs)}\n")
+
+    gterms = t.get("glossary_terms") or []
+    if gterms:
+        display = [g for g in gterms if not _UUID_RE.match(g)]
+        if display:
+            f.write(f"  Glossary: {', '.join(display)}\n")
+
+    owners = t.get("owner_users") or []
+    if owners:
+        f.write(f"  Owners: {', '.join(owners)}\n")
+
+    f.write("\n")
+
+
+def _render_layer_block(f, layer: str, layer_tables: list, ubiquitous_cm: set):
+    """Render a markdown table + enriched subsection for a layer's tables."""
+    f.write(f"### {layer} Layer ({len(layer_tables):,} tables)\n\n")
+    if not layer_tables:
+        f.write("(none)\n\n")
+        return
+
+    f.write(f"| {'Name':<50s} | {'Schema':<30s} | {'Columns':>7s} | {'Cert':<10s} |\n")
+    f.write(f"|{'-'*52}|{'-'*32}|{'-'*9}|{'-'*12}|\n")
+    for t in layer_tables:
+        name = t.get("name", "")[:50]
+        schema = (t.get("schema_name") or "")[:30]
+        col_count = str(t.get("_col_count", 0))
+        cert = t.get("certificate_status", "") or ""
+        f.write(f"| {name:<50s} | {schema:<30s} | {col_count:>7s} | {cert:<10s} |\n")
+    f.write("\n")
+
+    # Enriched subsection for tables with meaningful metadata
+    enriched = [t for t in layer_tables if _has_meaningful_metadata(t)]
+    if enriched:
+        f.write(f"#### {layer} — Enriched Detail ({len(enriched)} tables with metadata)\n\n")
+        for t in enriched:
+            _write_table_condensed_cm(f, t, ubiquitous_cm)
+
+
 def write_section_10_trusted_landing(f, ctx: dict):
-    """Trusted/Landing (Names Only) — simple markdown table."""
-    _write_section_header(f, 10, "Trusted & Landing Layers — Names Only")
+    """Trusted/Landing/Unknown — markdown table + enriched subsections for tables with metadata."""
+    _write_section_header(f, 10, "Trusted, Landing & Unknown Layers")
     tables = ctx["tables"]
+    ubiquitous_cm = ctx["ubiquitous_cm"]
 
     for layer in ("Trusted", "Landing"):
         layer_tables = [t for t in tables.values() if t.get("_layer") == layer]
         layer_tables.sort(key=lambda t: t.get("name", "").lower())
+        _render_layer_block(f, layer, layer_tables, ubiquitous_cm)
 
-        f.write(f"### {layer} Layer ({len(layer_tables):,} tables)\n\n")
-        if not layer_tables:
-            f.write("(none)\n\n")
-            continue
-
-        f.write(f"| {'Name':<50s} | {'Schema':<30s} | {'Columns':>7s} | {'Cert':<10s} |\n")
-        f.write(f"|{'-'*52}|{'-'*32}|{'-'*9}|{'-'*12}|\n")
-        for t in layer_tables:
-            name = t.get("name", "")[:50]
-            schema = (t.get("schema_name") or "")[:30]
-            col_count = str(t.get("_col_count", 0))
-            cert = t.get("certificate_status", "") or ""
-            f.write(f"| {name:<50s} | {schema:<30s} | {col_count:>7s} | {cert:<10s} |\n")
-        f.write("\n")
-
-    # Also include Unknown layer
+    # Unknown layer
     unknown = [t for t in tables.values() if t.get("_layer") == "Unknown"]
     if unknown:
         unknown.sort(key=lambda t: t.get("name", "").lower())
-        f.write(f"### Unknown Layer ({len(unknown):,} tables)\n\n")
-        f.write(f"| {'Name':<50s} | {'Schema':<30s} | {'Columns':>7s} | {'Cert':<10s} |\n")
-        f.write(f"|{'-'*52}|{'-'*32}|{'-'*9}|{'-'*12}|\n")
-        for t in unknown:
-            name = t.get("name", "")[:50]
-            schema = (t.get("schema_name") or "")[:30]
-            col_count = str(t.get("_col_count", 0))
-            cert = t.get("certificate_status", "") or ""
-            f.write(f"| {name:<50s} | {schema:<30s} | {col_count:>7s} | {cert:<10s} |\n")
-        f.write("\n")
+        _render_layer_block(f, "Unknown", unknown, ubiquitous_cm)
 
 
 def write_section_11_gaps(f, ctx: dict):
@@ -872,9 +949,26 @@ def write_section_11_gaps(f, ctx: dict):
         for app, app_count in top_apps:
             app_tables = [t for t in tables.values() if (t.get("_application") or "(none)") == app]
             at = len(app_tables)
+            if at == 0:
+                continue
             no_d = sum(1 for t in app_tables if not t.get("_has_real_desc"))
             no_r = sum(1 for t in app_tables if not t.get("_has_readme"))
             f.write(f"  {app[:35]:<35s} ({at:>5,}): desc {no_d/at*100:4.1f}% | readme {no_r/at*100:4.1f}%\n")
+        f.write("\n")
+
+    # Custom Entity coverage
+    ce = ctx.get("custom_entities", {})
+    if ce:
+        total_ce = len(ce)
+        ce_with_desc = sum(1 for c in ce.values()
+                          if c.get("description") and not is_placeholder_description(c.get("description", "")))
+        ce_with_cm = sum(1 for c in ce.values() if c.get("custom_metadata"))
+        ce_with_owner = sum(1 for c in ce.values() if c.get("owner_users") or c.get("owner_groups"))
+        f.write("### Custom Entity Coverage\n")
+        f.write(f"  Total Custom Entities: {total_ce:,}\n")
+        f.write(f"  With description:     {ce_with_desc:>5,} / {total_ce:,}  ({ce_with_desc/total_ce*100:4.1f}%)\n")
+        f.write(f"  With custom metadata: {ce_with_cm:>5,} / {total_ce:,}  ({ce_with_cm/total_ce*100:4.1f}%)\n")
+        f.write(f"  With owner:           {ce_with_owner:>5,} / {total_ce:,}  ({ce_with_owner/total_ce*100:4.1f}%)\n")
         f.write("\n")
 
     # Worst-documented tables (top 20)
@@ -918,12 +1012,81 @@ def write_section_11_gaps(f, ctx: dict):
     f.write("\n")
 
 
+def write_section_12_custom_entities(f, ctx: dict):
+    """Custom Entities — per-schema CM summaries with value distributions and samples."""
+    _write_section_header(f, 12, "Custom Entities")
+    ce = ctx.get("custom_entities", {})
+    ce_cm_schemas = ctx.get("ce_cm_schemas", {})
+
+    if not ce:
+        f.write("No custom entities found in this tenant.\n\n")
+        return
+
+    f.write(f"Total Custom Entities: {len(ce):,}\n\n")
+
+    if not ce_cm_schemas:
+        f.write("No custom metadata schemas found on custom entities.\n\n")
+        return
+
+    # Per CM schema summary
+    for schema_name in sorted(ce_cm_schemas.keys()):
+        schema_info = ce_cm_schemas[schema_name]
+        # Count unique entities with this schema
+        entities_with_schema = set()
+        for guid, entity in ce.items():
+            for cm in entity.get("custom_metadata") or []:
+                if cm.get("set") == schema_name:
+                    entities_with_schema.add(guid)
+                    break
+        f.write(f"### CM Schema: {schema_name} ({len(entities_with_schema):,} entities)\n\n")
+
+        # Attribute list with value distributions
+        attrs = schema_info.get("attributes", {})
+        for attr_name in sorted(attrs.keys()):
+            val_counter = attrs[attr_name]
+            total_vals = sum(val_counter.values())
+            unique_vals = len(val_counter)
+            f.write(f"  **{attr_name}** ({total_vals:,} values, {unique_vals:,} distinct)\n")
+            # Show top 5 values
+            for val, count in val_counter.most_common(5):
+                display_val = val if val else "(empty)"
+                f.write(f"    - {display_val}: {count:,}\n")
+            if unique_vals > 5:
+                f.write(f"    ... +{unique_vals - 5} more distinct values\n")
+        f.write("\n")
+
+        # 5 sample entities with their CM for this schema
+        samples = []
+        for guid, entity in ce.items():
+            if guid in entities_with_schema:
+                samples.append(entity)
+                if len(samples) >= 5:
+                    break
+
+        if samples:
+            f.write(f"  Sample entities:\n")
+            for s in samples:
+                f.write(f"  - **{s.get('name', '')}**")
+                desc = s.get("description", "")
+                if desc and not is_placeholder_description(desc):
+                    short_desc = _clean_html(desc)
+                    if len(short_desc) > 100:
+                        short_desc = short_desc[:100] + "..."
+                    f.write(f": {short_desc}")
+                f.write("\n")
+                # Show CM for this schema only
+                for cm in s.get("custom_metadata") or []:
+                    if cm.get("set") == schema_name:
+                        f.write(f"    {cm.get('attribute', '')}: {cm.get('value', '')}\n")
+            f.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
-    """Build and write the 11-section structured context file."""
+    """Build and write the 12-section structured context file."""
     _p(f"\n{'='*60}")
     _p("[Context Writer v2] Building structured context...")
     _p(f"{'='*60}")
@@ -937,7 +1100,7 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
     with open(context_path, "w") as f:
         f.write(f"# Structured Asset Context — {tenant}\n")
         f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"# Format: Context Writer v2 (11 sections)\n\n")
+        f.write(f"# Format: Context Writer v2 (12 sections)\n\n")
 
         write_section_1_header(f, ctx, tenant)
         write_section_2_glossary(f, ctx)
@@ -950,8 +1113,10 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
         write_section_9_enriched(f, ctx)
         write_section_10_trusted_landing(f, ctx)
         write_section_11_gaps(f, ctx)
+        write_section_12_custom_entities(f, ctx)
 
     elapsed = time.time() - t0
     _p(f"  Context written: {context_path}")
-    _p(f"  Sections: 11 | Tables: {ctx['total_tables']:,} | Time: {elapsed:.1f}s")
+    _p(f"  Sections: 12 | Tables: {ctx['total_tables']:,} | "
+       f"Custom Entities: {len(ctx['custom_entities']):,} | Time: {elapsed:.1f}s")
     return context_path

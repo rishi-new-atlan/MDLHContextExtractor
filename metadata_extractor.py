@@ -189,6 +189,7 @@ CORE_ASSET_TABLES = [
     ("glossaryterm",     "GlossaryTerm",     ("shortdescription", "longdescription")),
     ("glossarycategory", "GlossaryCategory", ()),
     ("connection",       "Connection",       ()),
+    ("customentity",     "CustomEntity",     ("ownerusers", "ownergroups", "certificatestatus", "meanings")),
 ]
 
 BI_ASSET_TYPES = [
@@ -429,6 +430,7 @@ def build_table_column_edges(asset_index):
                     "name": asset.name,
                     "description": asset.description,
                     "connector": asset.connector,
+                    "custom_metadata": asset.custom_metadata if asset.custom_metadata else [],
                 })
                 edges.append(RelationshipEdge(
                     source_guid=table.guid, source_name=table.name, source_type=table.asset_type,

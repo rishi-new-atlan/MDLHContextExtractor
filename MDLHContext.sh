@@ -38,7 +38,7 @@ source .venv/bin/activate
 # ── 2. Dependencies ───────────────────────────────────────────────────────────
 echo "[setup] Installing dependencies..."
 pip install --quiet --upgrade pip
-pip install --quiet pyiceberg pandas requests python-dotenv pyarrow
+pip install --quiet pyiceberg pandas requests python-dotenv pyarrow adlfs
 
 # ── 3. Environment check ──────────────────────────────────────────────────────
 ENV_FILE="$SCRIPT_DIR/.env"
