@@ -8,7 +8,8 @@ This pipeline connects to an Atlan tenant's Polaris/MDLH catalog via PyIceberg, 
 
 **Key features:**
 - Extracts assets, READMEs, tags, custom metadata, lineage, and glossary relationships
-- Scores assets by metadata richness (weighted scoring system)
+- Scores assets by metadata richness (weighted scoring system — custom metadata is the highest-value signal)
+- Produces a structured 12-section context file optimized for downstream question generation
 - Case-insensitive table/field name handling (works across all MDLH tenants)
 - Single command execution with automatic dependency management
 - Multi-tenant: same code, different `.env` per tenant
@@ -50,14 +51,17 @@ main.py ──> Connect to MDLH, select namespace, orchestrate pipeline
   |     [1/6] Build asset index (tables, views, columns, BI, transforms...)
   |     [2/6] Pull asset READMEs
   |     [3/6] Attach tags
-  |     [4/6] Attach custom metadata
-  |     [5/6] Build table → column relationships
+  |     [4/6] Attach custom metadata (propagated to parent tables)
+  |     [5/6] Build table → column relationships (with column-level CM)
   |     [6/6] Build lineage relationships (process, columnprocess, biprocess)
   |     [+]   Build glossary relationships
   |
-  └──> asset_scorer.py (score, rank, write output)
-        ├── data/scored_assets.json  (JSON cache)
-        └── output/context.txt       (hand-off file)
+  ├──> asset_scorer.py (score, rank, write JSON cache)
+  |     ├── data/scored_assets.json  (JSON cache)
+  |     └── output/context.txt       (flat fallback — grouped by type)
+  |
+  └──> context_writer_v2.py (structured 12-section context)
+        └── output/context.txt       (overwrites with structured format)
 ```
 
 ## File Descriptions
@@ -68,7 +72,8 @@ main.py ──> Connect to MDLH, select namespace, orchestrate pipeline
 | `main.py` | Orchestrator. Connects to MDLH, selects namespace, calls extractor then scorer |
 | `config.py` | Configuration. Loads `.env`, handles OAuth token, provides catalog connection with warehouse auto-discovery |
 | `metadata_extractor.py` | Core extraction engine. Builds in-memory asset index and relationship graph across 6 phases |
-| `asset_scorer.py` | Scoring and output. Ranks assets by metadata richness, writes `context.txt` and `scored_assets.json` |
+| `asset_scorer.py` | Scoring and output. Ranks assets by metadata richness, writes `scored_assets.json` and flat `context.txt` |
+| `context_writer_v2.py` | Structured context writer. Reads asset index and produces a 12-section `context.txt` optimized for question generation |
 | `.env.example` | Template for credentials |
 | `.gitignore` | Excludes `.env`, `.venv/`, `output/`, `data/` from git |
 
@@ -122,53 +127,98 @@ Resolves process/columnprocess/biprocess tables to build upstream/downstream lin
 
 ## Scoring System
 
-Each asset receives a score based on its metadata richness:
+Each asset receives a score based on its metadata richness. Custom metadata is treated as the highest-value signal:
 
 | Signal | Weight | Condition |
 |--------|--------|-----------|
+| Custom Metadata (very rich) | **5** | 10+ custom metadata attributes |
+| Custom Metadata (rich) | **4** | 3–9 custom metadata attributes |
+| Custom Metadata | **3** | 1–2 custom metadata attributes |
 | README | 3 | Asset has a README attached |
-| Description | 2 | Asset has a description |
-| Custom Metadata (rich) | 3 | 3+ custom metadata attributes |
-| Custom Metadata | 2 | 1-2 custom metadata attributes |
-| Lineage | 2 | Has upstream or downstream lineage |
 | Certificate: VERIFIED | 3 | Certificate status is VERIFIED |
+| Description | 2 | Asset has a description |
+| Lineage | 2 | Has upstream or downstream lineage |
 | Tags | 1 | Has any tags |
 | Glossary Terms | 1 | Linked to glossary terms |
 | Documented Columns | 1 | Table has 1+ column with a description |
+| Documented Columns (CM) | 1 | Table has 1+ column with custom metadata |
 | Certificate: DRAFT | 1 | Certificate status is DRAFT |
 | Is View | 1 | Asset is a View or MaterialisedView |
 
-**Maximum possible score: 17**
+**Maximum possible score: 19**
 
 ### Filtering & Output
 
-- Bare columns (no description) are excluded
-- Assets with score < 2 are excluded (unless they are GlossaryTerms, DataProducts, or DataDomains)
+- Bare columns (no description **and** no custom metadata) are excluded
+- Assets with score < 2 are excluded (unless they are GlossaryTerms, DataProducts, DataDomains, or CustomEntities)
 - Top 5,000 assets by score are written to output files
 
 ## Output Files
 
 ### `output/context.txt`
-Human-readable context file grouped by asset type. Each asset block includes:
-```
-=== Table: customer_master ===
-Connector: snowflake | DB: analytics | Schema: raw | Certificate: VERIFIED
-Qualified Name: snowflake/analytics/raw/customer_master
-Description: Master table of all customers...
-README: This table is the single source of truth...
-Columns: id, name (customer full name), email, +5 more
-Upstream: raw_events, web_clickstream
-Downstream: customer_segments
-Tags: pii, customer-facing
-Glossary: Customer Entity
-Custom Metadata: dq.confidence=high, governance.owner=alice
-Owners: alice@company.com
-Score: 14
----
-```
+Structured 12-section context file produced by `context_writer_v2.py`. Sections:
+
+| Section | Content |
+|---------|---------|
+| 1 | **Instance Header** — tenant, layer distribution, metadata coverage stats, custom entity count |
+| 2 | **Glossary Terms** — definitions, long descriptions, linked tables, categories, owners |
+| 3 | **Data Products** — descriptions, owners, domain assignments |
+| 4 | **Data Domains** — descriptions, table counts, key tables |
+| 5 | **Classification Legend** — tag types grouped with value distributions |
+| 6 | **Owner Directory** — markdown table with table counts, primary domain, layer distribution |
+| 7 | **Confusing Clusters** — tables grouped by business keyword with risk levels |
+| 8 | **Business Layer (Full)** — lifecycle flags, README fields, column stats, lineage, DQ, CM, tags |
+| 9 | **Enriched Layer (Condensed)** — stats, cryptic column flags, CM, tags |
+| 10 | **Trusted, Landing & Unknown** — markdown tables + enriched detail for tables with CM/descriptions/tags |
+| 11 | **Metadata Gap Summary** — overall/per-layer/per-application gaps, custom entity coverage, worst-documented tables |
+| 12 | **Custom Entities** — per-CM-schema summaries with attribute value distributions and sample entities |
 
 ### `data/scored_assets.json`
 JSON cache of all qualifying assets with full metadata and score breakdowns. Can be consumed by downstream tools without re-running extraction.
+
+## Using the Output
+
+### For question generation / simulation scenarios
+Feed `output/context.txt` directly to an LLM as context. The 12-section structure is designed for this:
+
+```
+# In your prompt:
+<context>
+{contents of output/context.txt}
+</context>
+
+Given the above metadata catalog context, generate realistic data governance questions...
+```
+
+The sections are ordered from most structured (glossary, products, domains) to most granular (per-table detail, gaps). An LLM can use Section 12 (Custom Entities) to understand what business-specific metadata schemas exist and what values they carry.
+
+### For programmatic consumption
+Use `data/scored_assets.json` directly:
+
+```python
+import json
+
+with open("data/scored_assets.json") as f:
+    data = json.load(f)
+
+# All qualifying assets with scores
+assets = data["assets"]
+
+# Find all assets with rich custom metadata
+cm_rich = [a for a in assets if len(a.get("custom_metadata", [])) >= 10]
+
+# Find tables with specific CM schema
+plum_tables = [
+    a for a in assets
+    if any(cm["set"] == "PLUM Timeseries Attributes" for cm in a.get("custom_metadata", []))
+]
+```
+
+### For data governance audits
+Section 11 (Metadata Gap Summary) shows exactly where documentation is missing — by layer, by application, and per custom entity. Use this to prioritize curation efforts:
+- Which layers have the worst description coverage?
+- Which applications have zero READMEs?
+- How many custom entities lack owners?
 
 ## Customization
 
