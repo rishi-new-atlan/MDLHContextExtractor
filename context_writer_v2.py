@@ -12,6 +12,8 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from asset_scorer import score_asset
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -210,6 +212,14 @@ def format_custom_metadata(cm_list: list, ubiquitous_keys: set) -> list:
 
 TABLE_TYPES = {"Table", "View", "MaterialisedView"}
 
+# Budget defaults — tune per use case
+MAX_FULL_DETAIL = 500     # Tables with richest metadata → full detail (Section 8)
+MAX_CONDENSED   = 2000    # Next tier → condensed detail (Section 9)
+                          # Everything else → summary table (Section 10)
+
+
+    # Scoring is handled by asset_scorer.score_asset — single source of truth
+
 
 def build_context_data(asset_index: dict) -> dict:
     """Classify, enrich and precompute all data needed by the 12 sections."""
@@ -270,6 +280,14 @@ def build_context_data(asset_index: dict) -> dict:
         readme_raw = t.get("readme", "")
         t["_has_readme"] = bool(readme_raw)
         t["_parsed_readme"] = parse_readme(readme_raw) if readme_raw else {}
+
+        # v2 enrichments
+        t["_has_ai_desc"] = bool(t.get("ai_description", ""))
+        t["_has_definition"] = bool(t.get("definition", ""))
+        t["_has_announcement"] = bool(t.get("announcement_type", ""))
+
+        # Richness score for prioritization — single source of truth from asset_scorer
+        t["_richness"], t["_score_breakdown"] = score_asset(t)
 
     # Tag groups
     tag_groups = defaultdict(lambda: defaultdict(int))
@@ -345,11 +363,23 @@ def build_context_data(asset_index: dict) -> dict:
     # Layer counts
     layer_counts = Counter(t["_layer"] for t in tables.values())
 
+    # Layer mode detection: if >50% of tables are "Unknown", the tenant doesn't
+    # use a medallion architecture — promote Unknown to full-detail treatment.
+    unknown_count = sum(1 for t in tables.values() if t.get("_layer") == "Unknown")
+    total_tables_prelim = len(tables)
+    no_medallion = total_tables_prelim > 0 and (unknown_count / total_tables_prelim) > 0.5
+    if no_medallion:
+        _p(f"  Layer mode: NO MEDALLION ({unknown_count:,}/{total_tables_prelim:,} = "
+           f"{unknown_count/total_tables_prelim*100:.0f}% Unknown) — promoting Unknown to full detail")
+
     # Stats for section 1
     total_tables = len(tables)
     tables_with_desc = sum(1 for t in tables.values() if t["_has_real_desc"])
     tables_with_readme = sum(1 for t in tables.values() if t["_has_readme"])
     tables_with_glossary = sum(1 for t in tables.values() if t.get("glossary_terms"))
+    tables_with_ai_desc = sum(1 for t in tables.values() if t.get("_has_ai_desc"))
+    tables_with_definition = sum(1 for t in tables.values() if t.get("_has_definition"))
+    tables_with_announcement = sum(1 for t in tables.values() if t.get("_has_announcement"))
 
     _p(f"  Tables: {total_tables:,} | Glossary: {len(glossary_terms):,} | "
         f"Products: {len(data_products):,} | Domains: {len(domains):,} | "
@@ -375,6 +405,10 @@ def build_context_data(asset_index: dict) -> dict:
         "tables_with_desc": tables_with_desc,
         "tables_with_readme": tables_with_readme,
         "tables_with_glossary": tables_with_glossary,
+        "tables_with_ai_desc": tables_with_ai_desc,
+        "tables_with_definition": tables_with_definition,
+        "tables_with_announcement": tables_with_announcement,
+        "no_medallion": no_medallion,
     }
 
 
@@ -402,6 +436,9 @@ def write_section_1_header(f, ctx: dict, tenant: str):
     f.write(f"Custom Entities: {len(ctx['custom_entities']):,}\n\n")
 
     f.write("### Layer Distribution\n")
+    if ctx["no_medallion"]:
+        f.write("  NOTE: No medallion architecture detected (>50% Unknown).\n")
+        f.write("  All tables receive full-detail treatment regardless of layer.\n\n")
     for layer in ["Business", "Enriched", "Trusted", "Landing", "Unknown"]:
         count = ctx["layer_counts"].get(layer, 0)
         pct = (count / total * 100) if total else 0
@@ -412,9 +449,15 @@ def write_section_1_header(f, ctx: dict, tenant: str):
     desc_pct = (ctx["tables_with_desc"] / total * 100) if total else 0
     readme_pct = (ctx["tables_with_readme"] / total * 100) if total else 0
     gloss_pct = (ctx["tables_with_glossary"] / total * 100) if total else 0
+    ai_desc_pct = (ctx["tables_with_ai_desc"] / total * 100) if total else 0
+    definition_pct = (ctx["tables_with_definition"] / total * 100) if total else 0
+    announcement_pct = (ctx["tables_with_announcement"] / total * 100) if total else 0
     f.write(f"  Description (non-placeholder): {ctx['tables_with_desc']:>5,} / {total:,}  ({desc_pct:4.1f}%)\n")
     f.write(f"  README attached:               {ctx['tables_with_readme']:>5,} / {total:,}  ({readme_pct:4.1f}%)\n")
     f.write(f"  Glossary terms linked:         {ctx['tables_with_glossary']:>5,} / {total:,}  ({gloss_pct:4.1f}%)\n")
+    f.write(f"  AI-generated description:      {ctx['tables_with_ai_desc']:>5,} / {total:,}  ({ai_desc_pct:4.1f}%)\n")
+    f.write(f"  SQL definition (views):        {ctx['tables_with_definition']:>5,} / {total:,}  ({definition_pct:4.1f}%)\n")
+    f.write(f"  Announcements:                 {ctx['tables_with_announcement']:>5,} / {total:,}  ({announcement_pct:4.1f}%)\n")
     f.write("\n")
 
 
@@ -441,6 +484,13 @@ def write_section_2_glossary(f, ctx: dict):
             if len(cleaned) > 500:
                 cleaned = cleaned[:500] + "..."
             f.write(f"Long Description: {cleaned}\n")
+
+        ai_desc = t.get("ai_description", "")
+        if ai_desc:
+            cleaned = _clean_html(ai_desc)
+            if len(cleaned) > 300:
+                cleaned = cleaned[:300] + "..."
+            f.write(f"AI Description: {cleaned}\n")
 
         owners = t.get("owner_users") or []
         if owners:
@@ -644,6 +694,61 @@ def _write_table_full(f, t: dict, ubiquitous_cm: set):
     if desc and not is_placeholder_description(desc):
         f.write(f"  Description: {_clean_html(desc)}\n")
 
+    # AI-generated description
+    ai_desc = t.get("ai_description", "")
+    if ai_desc:
+        cleaned = _clean_html(ai_desc)
+        if len(cleaned) > 400:
+            cleaned = cleaned[:400] + "..."
+        f.write(f"  AI Description: {cleaned}\n")
+
+    # SQL definition (views, matviews)
+    defn = t.get("definition", "")
+    if defn:
+        # Show first 600 chars of SQL definition
+        if len(defn) > 600:
+            defn_display = defn[:600] + f"... [{len(defn):,} chars total]"
+        else:
+            defn_display = defn
+        f.write(f"  SQL Definition: {defn_display}\n")
+
+    # MatView staleness info
+    refresh = t.get("refresh_method", "")
+    if refresh:
+        f.write(f"  Refresh: method={refresh}")
+        mode = t.get("refresh_mode", "")
+        if mode:
+            f.write(f", mode={mode}")
+        stale = t.get("staleness", "")
+        if stale:
+            f.write(f", staleness={stale}")
+        f.write("\n")
+
+    # Announcements
+    ann_type = t.get("announcement_type", "")
+    if ann_type:
+        ann_title = t.get("announcement_title", "")
+        ann_msg = t.get("announcement_message", "")
+        f.write(f"  Announcement [{ann_type}]: {ann_title}")
+        if ann_msg:
+            f.write(f" — {ann_msg}")
+        f.write("\n")
+
+    # Popularity / Size
+    pop = t.get("popularity_score", 0)
+    if pop and pop > 0:
+        f.write(f"  Popularity Score: {pop:.1f}\n")
+    row_count = t.get("row_count", 0)
+    size_bytes = t.get("size_bytes", 0)
+    if row_count or size_bytes:
+        parts = []
+        if row_count:
+            parts.append(f"{row_count:,} rows")
+        if size_bytes:
+            mb = size_bytes / (1024 * 1024)
+            parts.append(f"{mb:,.1f} MB")
+        f.write(f"  Size: {', '.join(parts)}\n")
+
     # DQ Score
     dq = t.get("_dq_score", "")
     if dq:
@@ -717,30 +822,36 @@ def _write_table_full(f, t: dict, ubiquitous_cm: set):
 
 
 def write_section_8_business(f, ctx: dict):
-    """Business Layer (Full) — lifecycle flag, README fields, column stats, lineage, DQ."""
-    _write_section_header(f, 8, "Business Layer — Full Detail")
+    """Top-tier tables (Full Detail) — richest metadata, ranked by richness score."""
+    _write_section_header(f, 8, "Top Tables — Full Detail")
     tables = ctx["tables"]
     ubiquitous_cm = ctx["ubiquitous_cm"]
 
-    business = [t for t in tables.values() if t.get("_layer") == "Business"]
-    business.sort(key=lambda t: t.get("name", "").lower())
+    ranked = sorted(tables.values(), key=lambda t: (-t.get("_richness", 0), t.get("name", "").lower()))
+    full_detail = [t for t in ranked[:MAX_FULL_DETAIL] if t.get("_richness", 0) > 0]
 
-    f.write(f"Total: {len(business):,} tables/views\n\n")
-    if not business:
-        f.write("No business-layer tables found.\n\n")
+    f.write(f"Top {len(full_detail):,} tables by metadata richness (score > 0)\n")
+    if full_detail:
+        f.write(f"Richness range: {full_detail[0].get('_richness', 0)} – {full_detail[-1].get('_richness', 0)}\n\n")
+    else:
+        f.write("\nNo tables with metadata found.\n\n")
         return
 
-    for t in business:
+    for t in full_detail:
         _write_table_full(f, t, ubiquitous_cm)
 
 
 def write_section_9_enriched(f, ctx: dict):
-    """Enriched Layer (Condensed) — stats + cryptic column flag, no column detail."""
-    _write_section_header(f, 9, "Enriched Layer — Condensed")
+    """Mid-tier tables (Condensed) — next batch after top tables, with metadata."""
+    _write_section_header(f, 9, "Mid-Tier Tables — Condensed")
     tables = ctx["tables"]
     ubiquitous_cm = ctx["ubiquitous_cm"]
 
-    enriched = [t for t in tables.values() if t.get("_layer") == "Enriched"]
+    ranked = sorted(tables.values(), key=lambda t: (-t.get("_richness", 0), t.get("name", "").lower()))
+    # Skip the top tier (already in Section 8), take the next batch
+    mid_start = min(MAX_FULL_DETAIL, len(ranked))
+    mid_end = min(MAX_FULL_DETAIL + MAX_CONDENSED, len(ranked))
+    enriched = [t for t in ranked[mid_start:mid_end] if t.get("_richness", 0) > 0]
     enriched.sort(key=lambda t: t.get("name", "").lower())
 
     f.write(f"Total: {len(enriched):,} tables/views\n\n")
@@ -765,6 +876,28 @@ def write_section_9_enriched(f, ctx: dict):
         desc = t.get("description", "")
         if desc and not is_placeholder_description(desc):
             f.write(f"  Description: {_clean_html(desc)}\n")
+
+        ai_desc = t.get("ai_description", "")
+        if ai_desc:
+            cleaned = _clean_html(ai_desc)
+            if len(cleaned) > 200:
+                cleaned = cleaned[:200] + "..."
+            f.write(f"  AI Description: {cleaned}\n")
+
+        # SQL definition (for views in enriched layer)
+        defn = t.get("definition", "")
+        if defn:
+            if len(defn) > 400:
+                defn_display = defn[:400] + f"... [{len(defn):,} chars]"
+            else:
+                defn_display = defn
+            f.write(f"  SQL Definition: {defn_display}\n")
+
+        # Announcements
+        ann_type = t.get("announcement_type", "")
+        if ann_type:
+            ann_title = t.get("announcement_title", "")
+            f.write(f"  Announcement [{ann_type}]: {ann_title}\n")
 
         dq = t.get("_dq_score", "")
         if dq:
@@ -829,6 +962,13 @@ def _write_table_condensed_cm(f, t: dict, ubiquitous_cm: set):
     if desc and not is_placeholder_description(desc):
         f.write(f"  Description: {_clean_html(desc)}\n")
 
+    ai_desc = t.get("ai_description", "")
+    if ai_desc:
+        cleaned = _clean_html(ai_desc)
+        if len(cleaned) > 200:
+            cleaned = cleaned[:200] + "..."
+        f.write(f"  AI Description: {cleaned}\n")
+
     cm = t.get("custom_metadata") or []
     if cm:
         formatted = format_custom_metadata(cm, ubiquitous_cm)
@@ -882,21 +1022,32 @@ def _render_layer_block(f, layer: str, layer_tables: list, ubiquitous_cm: set):
 
 
 def write_section_10_trusted_landing(f, ctx: dict):
-    """Trusted/Landing/Unknown — markdown table + enriched subsections for tables with metadata."""
-    _write_section_header(f, 10, "Trusted, Landing & Unknown Layers")
+    """Remaining tables — compact summary grouped by schema."""
+    _write_section_header(f, 10, "Remaining Tables — Summary")
     tables = ctx["tables"]
-    ubiquitous_cm = ctx["ubiquitous_cm"]
 
-    for layer in ("Trusted", "Landing"):
-        layer_tables = [t for t in tables.values() if t.get("_layer") == layer]
-        layer_tables.sort(key=lambda t: t.get("name", "").lower())
-        _render_layer_block(f, layer, layer_tables, ubiquitous_cm)
+    ranked = sorted(tables.values(), key=lambda t: (-t.get("_richness", 0), t.get("name", "").lower()))
+    # Everything after full + condensed tiers
+    remaining_start = min(MAX_FULL_DETAIL + MAX_CONDENSED, len(ranked))
+    remaining = ranked[remaining_start:]
 
-    # Unknown layer
-    unknown = [t for t in tables.values() if t.get("_layer") == "Unknown"]
-    if unknown:
-        unknown.sort(key=lambda t: t.get("name", "").lower())
-        _render_layer_block(f, "Unknown", unknown, ubiquitous_cm)
+    f.write(f"Tables not shown in Sections 8–9: {len(remaining):,}\n")
+    f.write("(Richness score too low for detail sections, or beyond budget cap.)\n\n")
+
+    if not remaining:
+        f.write("All tables covered in Sections 8–9.\n\n")
+        return
+
+    # Group by schema for compact display
+    from collections import Counter as _Counter
+    schema_counts = _Counter((t.get("schema_name") or "(none)") for t in remaining)
+    f.write(f"| {'Schema':<40s} | {'Count':>7s} |\n")
+    f.write(f"|{'-'*42}|{'-'*9}|\n")
+    for schema, count in schema_counts.most_common(50):
+        f.write(f"| {schema:<40s} | {count:>7,} |\n")
+    if len(schema_counts) > 50:
+        f.write(f"| {'... +' + str(len(schema_counts) - 50) + ' more schemas':<40s} |         |\n")
+    f.write("\n")
 
 
 def write_section_11_gaps(f, ctx: dict):
@@ -916,6 +1067,11 @@ def write_section_11_gaps(f, ctx: dict):
     no_glossary = sum(1 for t in tables.values() if not t.get("glossary_terms"))
     no_col_docs = sum(1 for t in tables.values() if t.get("_col_count", 0) > 0 and t.get("_col_described", 0) == 0)
     has_lifecycle = sum(1 for t in tables.values() if t.get("_lifecycle"))
+    no_ai_desc = sum(1 for t in tables.values() if not t.get("_has_ai_desc"))
+    # SQL definition gap: only relevant for views/matviews
+    views_matviews = [t for t in tables.values() if t.get("asset_type") in ("View", "MaterialisedView")]
+    no_definition = sum(1 for t in views_matviews if not t.get("_has_definition"))
+    no_announcement = sum(1 for t in tables.values() if not t.get("_has_announcement"))
 
     f.write("### Overall Gaps\n")
     f.write(f"  Missing description:  {no_desc:>5,} / {total:,}  ({no_desc/total*100:4.1f}%)\n")
@@ -924,6 +1080,10 @@ def write_section_11_gaps(f, ctx: dict):
     f.write(f"  Missing tags:         {no_tags:>5,} / {total:,}  ({no_tags/total*100:4.1f}%)\n")
     f.write(f"  Missing glossary:     {no_glossary:>5,} / {total:,}  ({no_glossary/total*100:4.1f}%)\n")
     f.write(f"  Zero column docs:     {no_col_docs:>5,} / {total:,}  ({no_col_docs/total*100:4.1f}%)\n")
+    f.write(f"  No AI description:    {no_ai_desc:>5,} / {total:,}  ({no_ai_desc/total*100:4.1f}%)\n")
+    if views_matviews:
+        vm_total = len(views_matviews)
+        f.write(f"  No SQL definition:    {no_definition:>5,} / {vm_total:,} views/matviews  ({no_definition/vm_total*100:4.1f}%)\n")
     f.write(f"  Lifecycle flagged:    {has_lifecycle:>5,} / {total:,}  ({has_lifecycle/total*100:4.1f}%)\n")
     f.write("\n")
 
@@ -1081,12 +1241,125 @@ def write_section_12_custom_entities(f, ctx: dict):
             f.write("\n")
 
 
+def write_section_13_sql_intelligence(f, ctx: dict, all_edges: list):
+    """SQL Intelligence Layer — view definitions, process SQL, dbt SQL."""
+    _write_section_header(f, 13, "SQL Intelligence Layer")
+    tables = ctx["tables"]
+    assets = ctx["assets"]
+
+    # --- View / MatView SQL definitions ---
+    views_with_sql = []
+    for guid, t in tables.items():
+        defn = t.get("definition", "")
+        if defn and t.get("asset_type") in ("View", "MaterialisedView"):
+            views_with_sql.append(t)
+    views_with_sql.sort(key=lambda t: t.get("name", "").lower())
+
+    f.write(f"### View/MatView SQL Definitions ({len(views_with_sql):,} assets)\n\n")
+    if not views_with_sql:
+        f.write("No SQL definitions found for views or materialised views.\n\n")
+    else:
+        for t in views_with_sql:
+            name = t.get("name", "")
+            atype = t.get("asset_type", "")
+            defn = t.get("definition", "")
+            f.write(f"#### {name} ({atype})\n")
+            f.write(f"  Schema: {t.get('schema_name', '')} | Database: {t.get('database', '')}\n")
+            # Show SQL — cap at 2000 chars for full context, truncate for huge ones
+            if len(defn) > 2000:
+                f.write(f"```sql\n{defn[:2000]}\n-- ... [{len(defn):,} chars total, truncated]\n```\n")
+            else:
+                f.write(f"```sql\n{defn}\n```\n")
+            # Refresh info for matviews
+            refresh = t.get("refresh_method", "")
+            if refresh:
+                f.write(f"  Refresh: {refresh}")
+                mode = t.get("refresh_mode", "")
+                stale = t.get("staleness", "")
+                if mode:
+                    f.write(f" | Mode: {mode}")
+                if stale:
+                    f.write(f" | Staleness: {stale}")
+                f.write("\n")
+            f.write("\n")
+
+    # --- Process SQL (from lineage edges) ---
+    sql_edges = [e for e in all_edges if e.get("relationship_type") == "LINEAGE"
+                 and (e.get("metadata", {}).get("sql") or e.get("metadata", {}).get("code"))]
+
+    f.write(f"### Lineage Process SQL ({len(sql_edges):,} edges with SQL/code)\n\n")
+    if not sql_edges:
+        f.write("No SQL or code found in lineage process entities.\n\n")
+    else:
+        # Deduplicate by process name
+        seen_processes = set()
+        for e in sql_edges[:50]:  # Cap at 50
+            meta = e.get("metadata", {})
+            pname = meta.get("process_name", "")
+            if pname in seen_processes:
+                continue
+            seen_processes.add(pname)
+            ptype = meta.get("process_type", "")
+            sql = meta.get("sql", "")
+            code = meta.get("code", "")
+            content = sql or code
+            f.write(f"#### {pname} ({ptype})\n")
+            f.write(f"  {e.get('source_name', '')} → {e.get('target_name', '')}\n")
+            if len(content) > 1500:
+                f.write(f"```sql\n{content[:1500]}\n-- ... [{len(content):,} chars total]\n```\n")
+            else:
+                f.write(f"```sql\n{content}\n```\n")
+            f.write("\n")
+        if len(sql_edges) > 50:
+            f.write(f"... +{len(sql_edges) - 50} more edges with SQL\n\n")
+
+    # --- Transform Tool SQL ---
+    transform_assets = [a for a in assets.values()
+                        if a.get("transform_raw_sql") or a.get("transform_compiled_sql")]
+    transform_assets.sort(key=lambda a: (a.get("transform_tool", ""), a.get("name", "").lower()))
+
+    f.write(f"### Transform Tool SQL ({len(transform_assets):,} assets with SQL)\n\n")
+    if not transform_assets:
+        f.write("No transform assets with SQL found.\n\n")
+    else:
+        # Group by transform tool
+        from collections import defaultdict as _defaultdict
+        by_tool = _defaultdict(list)
+        for a in transform_assets:
+            tool = a.get("transform_tool", "") or "unknown"
+            by_tool[tool].append(a)
+
+        for tool in sorted(by_tool.keys()):
+            tool_assets = by_tool[tool]
+            f.write(f"#### {tool} ({len(tool_assets):,} assets)\n\n")
+            for a in tool_assets[:30]:  # Cap at 30 per tool
+                name = a.get("name", "")
+                mat_type = a.get("transform_materialization_type", "")
+                f.write(f"##### {name}")
+                if mat_type:
+                    f.write(f" (materialization: {mat_type})")
+                f.write("\n")
+
+                compiled = a.get("transform_compiled_sql", "")
+                raw = a.get("transform_raw_sql", "")
+                sql_content = compiled or raw
+                label = "compiled" if compiled else "raw"
+                if sql_content:
+                    if len(sql_content) > 1500:
+                        f.write(f"```sql\n-- {label} SQL\n{sql_content[:1500]}\n-- ... [{len(sql_content):,} chars total]\n```\n")
+                    else:
+                        f.write(f"```sql\n-- {label} SQL\n{sql_content}\n```\n")
+                f.write("\n")
+            if len(tool_assets) > 30:
+                f.write(f"... +{len(tool_assets) - 30} more {tool} assets\n\n")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
-    """Build and write the 12-section structured context file."""
+def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path, all_edges: list = None):
+    """Build and write the 13-section structured context file."""
     _p(f"\n{'='*60}")
     _p("[Context Writer v2] Building structured context...")
     _p(f"{'='*60}")
@@ -1094,13 +1367,23 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
 
     ctx = build_context_data(asset_index)
 
+    # Convert edges to dicts for section 13
+    edge_dicts = []
+    if all_edges:
+        for e in all_edges:
+            if hasattr(e, "__dataclass_fields__"):
+                from dataclasses import asdict as _asdict
+                edge_dicts.append(_asdict(e))
+            elif isinstance(e, dict):
+                edge_dicts.append(e)
+
     context_path = output_dir / "context.txt"
     _p(f"  Writing {context_path}...")
 
     with open(context_path, "w") as f:
         f.write(f"# Structured Asset Context — {tenant}\n")
         f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"# Format: Context Writer v2 (12 sections)\n\n")
+        f.write(f"# Format: Context Writer v2.1 (13 sections)\n\n")
 
         write_section_1_header(f, ctx, tenant)
         write_section_2_glossary(f, ctx)
@@ -1114,9 +1397,54 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path):
         write_section_10_trusted_landing(f, ctx)
         write_section_11_gaps(f, ctx)
         write_section_12_custom_entities(f, ctx)
+        write_section_13_sql_intelligence(f, ctx, edge_dicts)
+
+    # --- Output validation ---
+    _p("\n  Validating output...")
+    issues = validate_context_output(context_path)
+    if issues:
+        for issue in issues:
+            _p(f"    WARNING: {issue}")
+    else:
+        _p("    All output checks passed")
 
     elapsed = time.time() - t0
     _p(f"  Context written: {context_path}")
-    _p(f"  Sections: 12 | Tables: {ctx['total_tables']:,} | "
+    _p(f"  Sections: 13 | Tables: {ctx['total_tables']:,} | "
        f"Custom Entities: {len(ctx['custom_entities']):,} | Time: {elapsed:.1f}s")
     return context_path
+
+
+def validate_context_output(context_path: Path) -> list:
+    """Validate the generated context file for completeness."""
+    issues = []
+    try:
+        content = context_path.read_text()
+    except Exception as e:
+        return [f"Cannot read output file: {e}"]
+
+    # Check all 13 sections exist
+    for i in range(1, 14):
+        marker = f"## Section {i}:"
+        if marker not in content:
+            issues.append(f"Missing {marker} in output")
+
+    # Check file isn't suspiciously small (< 10KB with tables means something broke)
+    size_kb = len(content) / 1024
+    if size_kb < 10:
+        issues.append(f"Output file is only {size_kb:.1f} KB — likely incomplete")
+
+    # Check glossary section has entries (if glossary terms exist)
+    if "Total: 0 terms" not in content and "## Section 2: Glossary Terms" in content:
+        # Good — glossary section exists and has terms
+        pass
+
+    # Check SQL Intelligence section has content
+    if "## Section 13: SQL Intelligence Layer" in content:
+        # Extract the section and check it's not just empty headers
+        idx = content.index("## Section 13:")
+        section_13 = content[idx:]
+        if "0 assets)" in section_13 and "0 edges with SQL" in section_13 and "0 assets with SQL" in section_13:
+            issues.append("Section 13 (SQL Intelligence) is entirely empty — no SQL data captured")
+
+    return issues

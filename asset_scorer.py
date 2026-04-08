@@ -36,6 +36,13 @@ WEIGHTS = {
     "certificate_verified":      3,   # VERIFIED — strongest trust signal
     "certificate_draft":         1,   # DRAFT — some curation intent
     "is_view":                   1,   # View / MaterialisedView — curated/derived assets
+    # v2 fields
+    "ai_description":            1,   # AI-generated description present
+    "sql_definition":            2,   # SQL definition (views, matviews) — transformation logic
+    "transform_sql":             2,   # transform compiled/raw SQL present
+    "announcement":              1,   # active announcement on asset
+    "popularity":                1,   # non-zero popularity score
+    "owner":                     1,   # has assigned owner (user or group)
 }
 
 ALWAYS_INCLUDE_TYPES = {"GlossaryTerm", "DataProduct", "DataDomain", "CustomEntity"}
@@ -69,6 +76,13 @@ def score_asset(asset: dict) -> tuple:
         "certificate_verified": WEIGHTS["certificate_verified"] if cert == "VERIFIED"           else 0,
         "certificate_draft":    WEIGHTS["certificate_draft"]    if cert == "DRAFT"              else 0,
         "is_view":              WEIGHTS["is_view"]              if atype in ("View", "MaterialisedView") else 0,
+        # v2 fields
+        "ai_description":       WEIGHTS["ai_description"]       if asset.get("ai_description")  else 0,
+        "sql_definition":       WEIGHTS["sql_definition"]       if asset.get("definition")      else 0,
+        "transform_sql":        WEIGHTS["transform_sql"]        if (asset.get("transform_raw_sql") or asset.get("transform_compiled_sql")) else 0,
+        "announcement":         WEIGHTS["announcement"]         if asset.get("announcement_type") else 0,
+        "popularity":           WEIGHTS["popularity"]           if (asset.get("popularity_score") or 0) > 0 else 0,
+        "owner":                WEIGHTS["owner"]                if (asset.get("owner_users") or asset.get("owner_groups")) else 0,
     }
     return sum(breakdown.values()), breakdown
 

@@ -7,9 +7,11 @@ Extract, score, and prioritize data asset metadata from an Atlan MDLH (Metadata 
 This pipeline connects to an Atlan tenant's Polaris/MDLH catalog via PyIceberg, extracts rich metadata for all data assets (tables, views, columns, BI dashboards, dbt models, glossary terms, etc.), scores them by documentation quality, and outputs a prioritized context file.
 
 **Key features:**
+- **Dynamic entity discovery** — auto-discovers all 459+ MDLH entity tables and categorizes them across 20 categories (core, BI, transform, streaming, storage, governance, AI/ML, semantic, ERP, NoSQL, etc.)
 - Extracts assets, READMEs, tags, custom metadata, lineage, and glossary relationships
 - Scores assets by metadata richness (weighted scoring system — custom metadata is the highest-value signal)
-- Produces a structured 12-section context file optimized for downstream question generation
+- Produces a structured 13-section context file optimized for downstream question generation
+- **Connector-agnostic** — adding a new tool only requires a prefix in the category registry, no code changes
 - Case-insensitive table/field name handling (works across all MDLH tenants)
 - Single command execution with automatic dependency management
 - Multi-tenant: same code, different `.env` per tenant
@@ -71,9 +73,9 @@ main.py ──> Connect to MDLH, select namespace, orchestrate pipeline
 | `MDLHContext.sh` | Entry point. Creates venv, installs dependencies, validates `.env`, runs `main.py` |
 | `main.py` | Orchestrator. Connects to MDLH, selects namespace, calls extractor then scorer |
 | `config.py` | Configuration. Loads `.env`, handles OAuth token, provides catalog connection with warehouse auto-discovery |
-| `metadata_extractor.py` | Core extraction engine. Builds in-memory asset index and relationship graph across 6 phases |
+| `metadata_extractor.py` | Core extraction engine. Dynamic entity discovery + builds in-memory asset index and relationship graph across 6 phases |
 | `asset_scorer.py` | Scoring and output. Ranks assets by metadata richness, writes `scored_assets.json` and flat `context.txt` |
-| `context_writer_v2.py` | Structured context writer. Reads asset index and produces a 12-section `context.txt` optimized for question generation |
+| `context_writer_v2.py` | Structured context writer. Reads asset index and produces a 13-section `context.txt` optimized for question generation |
 | `.env.example` | Template for credentials |
 | `.gitignore` | Excludes `.env`, `.venv/`, `output/`, `data/` from git |
 
@@ -102,13 +104,33 @@ For every asset, the following fields are extracted (when available):
 ## Extraction Phases
 
 ### Phase 1: Build Asset Index
-Scans all asset tables in the MDLH catalog (filtered to `status == 'ACTIVE'`):
+Dynamically discovers all entity tables in the MDLH namespace (typically 459+) and categorizes them into 20 categories. Scans each table filtered to `status == 'ACTIVE'`.
 
-**Core assets:** Table, View, MaterialisedView, Column, DataProduct, DataDomain, GlossaryTerm, GlossaryCategory, Connection
+**Categories (20):**
 
-**BI assets:** Power BI (dashboards, reports, datasets, tables), Tableau (dashboards, workbooks), Looker (dashboards, explores, fields, views), Metabase, Superset, Sigma, Redash, Mode, Cognos, Domo, Qlik, ThoughtSpot, MicroStrategy
+| Category | Match | Examples |
+|---|---|---|
+| core_table/view/matview/column | exact | table, view, materialisedview, column |
+| glossary | exact | glossaryterm, glossarycategory |
+| data_mesh | exact | dataproduct, datadomain, datameshdataset |
+| custom_entity | exact | customentity |
+| connection | exact | connection |
+| governance | exact + prefix | persona, purpose, stakeholder* |
+| ai_ml | exact + prefix | aiapplication, sagemaker*, databricksai*, snowflakeai* |
+| semantic | exact + prefix | dbtsemanticmodel, semantic*, snowflakesemantic* |
+| bi | prefix | powerbi*, tableau*, looker*, sigma*, mode*, metabase*, superset*, preset*, domo*, qlik*, thoughtspot*, cognos*, microstrategy*, redash*, sisense*, quicksight*, datastudio*, fabric*, anaplan*, hex* |
+| transform | prefix | dbt*, matillion*, adf*, fivetran*, spark*, airflow*, flow* |
+| data_quality | prefix | mc*, soda*, anomalo*, dataqualityrule*, datacontract*, businesspolicy* |
+| streaming | prefix | kafka*, azureeventhub*, azureservicebus*, schemaregistry* |
+| storage | prefix | s3*, adls*, gcs* |
+| erp | prefix | salesforce*, saperp*, dataverse* |
+| snowflake_native | prefix (excl. ai/semantic) | snowflake* |
+| databricks_native | prefix (excl. ai) | databricks* |
+| nosql | prefix | cosmosmongodb*, dynamodb*, mongodb*, cassandra*, documentdb* |
 
-**Transform/DQ assets:** dbt (models, sources, metrics), Airflow (DAGs, tasks), ADF pipelines, Fivetran connectors, Spark jobs, Monte Carlo monitors, Soda checks, Anomalo checks — *note: only basic asset metadata is extracted for DQ tools, not rule definitions or check results*
+System tables (readme, tag, process, link, badge, workflow*) are automatically skipped. Uncategorized tables are logged for investigation.
+
+**Adding a new connector:** just add its prefix to the appropriate category in `ENTITY_CATEGORIES`. No other code changes needed.
 
 ### Phase 2: Pull READMEs
 Matches README content to parent assets via GUID reference or qualified name inference.
@@ -137,7 +159,13 @@ Each asset receives a score based on its metadata richness. Custom metadata is t
 | README | 3 | Asset has a README attached |
 | Certificate: VERIFIED | 3 | Certificate status is VERIFIED |
 | Description | 2 | Asset has a description |
+| SQL Definition | 2 | SQL definition present (views, matviews) |
+| Transform SQL | 2 | Transform compiled/raw SQL present (dbt, matillion, etc.) |
 | Lineage | 2 | Has upstream or downstream lineage |
+| AI Description | 1 | AI-generated description present |
+| Announcement | 1 | Active announcement on asset |
+| Popularity | 1 | Non-zero popularity score |
+| Owner | 1 | Has assigned owner (user or group) |
 | Tags | 1 | Has any tags |
 | Glossary Terms | 1 | Linked to glossary terms |
 | Documented Columns | 1 | Table has 1+ column with a description |
@@ -145,7 +173,7 @@ Each asset receives a score based on its metadata richness. Custom metadata is t
 | Certificate: DRAFT | 1 | Certificate status is DRAFT |
 | Is View | 1 | Asset is a View or MaterialisedView |
 
-**Maximum possible score: 19**
+**Maximum possible score: 27**
 
 ### Filtering & Output
 
@@ -156,7 +184,7 @@ Each asset receives a score based on its metadata richness. Custom metadata is t
 ## Output Files
 
 ### `output/context.txt`
-Structured 12-section context file produced by `context_writer_v2.py`. Sections:
+Structured 13-section context file produced by `context_writer_v2.py`. Sections:
 
 | Section | Content |
 |---------|---------|
@@ -167,11 +195,12 @@ Structured 12-section context file produced by `context_writer_v2.py`. Sections:
 | 5 | **Classification Legend** — tag types grouped with value distributions |
 | 6 | **Owner Directory** — markdown table with table counts, primary domain, layer distribution |
 | 7 | **Confusing Clusters** — tables grouped by business keyword with risk levels |
-| 8 | **Business Layer (Full)** — lifecycle flags, README fields, column stats, lineage, DQ, CM, tags |
-| 9 | **Enriched Layer (Condensed)** — stats, cryptic column flags, CM, tags |
-| 10 | **Trusted, Landing & Unknown** — markdown tables + enriched detail for tables with CM/descriptions/tags |
+| 8 | **Top Tables (Full Detail)** — lifecycle flags, README fields, column stats, lineage, DQ, CM, tags |
+| 9 | **Mid-Tier Tables (Condensed)** — stats, cryptic column flags, CM, tags |
+| 10 | **Remaining Tables (Summary)** — grouped by schema |
 | 11 | **Metadata Gap Summary** — overall/per-layer/per-application gaps, custom entity coverage, worst-documented tables |
 | 12 | **Custom Entities** — per-CM-schema summaries with attribute value distributions and sample entities |
+| 13 | **SQL Intelligence Layer** — view/matview SQL definitions, lineage process SQL, transform tool SQL (grouped by tool) |
 
 ### `data/scored_assets.json`
 JSON cache of all qualifying assets with full metadata and score breakdowns. Can be consumed by downstream tools without re-running extraction.
@@ -222,11 +251,11 @@ Section 11 (Metadata Gap Summary) shows exactly where documentation is missing �
 
 ## Customization
 
-### Adding New Asset Types
-Edit the lists in `metadata_extractor.py`:
-- `CORE_ASSET_TABLES` — for assets with specific field requirements
-- `BI_ASSET_TYPES` — for BI/dashboard tools
-- `TRANSFORM_ASSET_TYPES` — for ETL/transform tools
+### Adding New Connectors/Asset Types
+Edit `ENTITY_CATEGORIES` in `metadata_extractor.py`:
+- Add a prefix to an existing category's `prefixes` list (e.g., add `"newbi"` to the `bi` category)
+- Or create a new category with `exact`/`prefixes`, `extra_fields`, and optional `label_map`
+- Add the tool's PascalCase prefix to `_PREFIX_CASING` if it has non-trivial casing (e.g., `("newbi", "NewBI")`)
 
 ### Adjusting Scores
 Edit the constants in `asset_scorer.py`:

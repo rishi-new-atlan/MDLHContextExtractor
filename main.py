@@ -27,9 +27,9 @@ def main():
     ns = find_entity_namespace(namespaces)
     print(f"Using namespace: {ns}")
 
-    asset_index, all_edges = extract_metadata(catalog, ns, ATLAN_TENANT)
+    asset_index, all_edges, discovery_report = extract_metadata(catalog, ns, ATLAN_TENANT)
     run_scorer(asset_index, all_edges, ATLAN_TENANT, DATA_DIR, OUTPUT_DIR)
-    run_context_writer_v2(asset_index, ATLAN_TENANT, OUTPUT_DIR)
+    run_context_writer_v2(asset_index, ATLAN_TENANT, OUTPUT_DIR, all_edges=all_edges)
 
 
 if __name__ == "__main__":
