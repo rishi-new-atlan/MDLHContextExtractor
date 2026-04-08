@@ -4,7 +4,7 @@ Extract, score, and prioritize data asset metadata from an Atlan MDLH (Metadata 
 
 ## Overview
 
-This pipeline connects to an Atlan tenant's Polaris/MDLH catalog via PyIceberg, extracts rich metadata for all data assets (tables, views, columns, BI dashboards, dbt models, glossary terms, etc.), scores them by documentation quality, and outputs a prioritized context file.
+This pipeline connects to an Atlan tenant's Polaris/MDLH catalog via PyIceberg, dynamically discovers all entity tables (459+), extracts rich metadata for every data asset (tables, views, columns, BI dashboards, transform models, glossary terms, streaming, storage, AI/ML, and more), scores them by documentation quality, and outputs a prioritized context file.
 
 **Key features:**
 - **Dynamic entity discovery** — auto-discovers all 459+ MDLH entity tables and categorizes them across 20 categories (core, BI, transform, streaming, storage, governance, AI/ML, semantic, ERP, NoSQL, etc.)
@@ -49,20 +49,22 @@ MDLHContext.sh ──> Setup venv, install deps, validate .env
   v
 main.py ──> Connect to MDLH, select namespace, orchestrate pipeline
   |
-  ├──> metadata_extractor.py (6-phase extraction)
-  |     [1/6] Build asset index (tables, views, columns, BI, transforms...)
+  ├──> metadata_extractor.py (dynamic discovery + 6-phase extraction)
+  |     [0]   Discover & categorize all 459+ entity tables (1 API call)
+  |     [1/6] Build asset index (20 categories: core, BI, transform, streaming...)
   |     [2/6] Pull asset READMEs
   |     [3/6] Attach tags
   |     [4/6] Attach custom metadata (propagated to parent tables)
   |     [5/6] Build table → column relationships (with column-level CM)
   |     [6/6] Build lineage relationships (process, columnprocess, biprocess)
   |     [+]   Build glossary relationships
+  |     Returns: asset_index, all_edges, discovery_report
   |
   ├──> asset_scorer.py (score, rank, write JSON cache)
   |     ├── data/scored_assets.json  (JSON cache)
   |     └── output/context.txt       (flat fallback — grouped by type)
   |
-  └──> context_writer_v2.py (structured 12-section context)
+  └──> context_writer_v2.py (structured 13-section context)
         └── output/context.txt       (overwrites with structured format)
 ```
 
@@ -94,6 +96,12 @@ For every asset, the following fields are extracted (when available):
 - **Glossary terms** — linked business glossary terms
 - **Custom metadata** — all custom metadata attributes (set.attribute = value)
 - **Lineage** — upstream and downstream relationships via process/ETL tables
+- **AI-generated description** — Atlan AI description (when available)
+- **SQL definition** — view/matview SQL (transformation logic)
+- **Transform SQL** — compiled/raw SQL from transform tools (dbt, matillion, ADF, etc.)
+- **Announcements** — active announcements on assets
+- **Popularity score** — usage-based popularity
+- **MatView refresh info** — refresh method, mode, staleness
 
 ### What is NOT extracted
 - **Data quality rule definitions/logic** — DQ tools (Monte Carlo, Soda, Anomalo) are indexed as assets with basic metadata (name, description), but their actual rule definitions, thresholds, check results, and pass/fail status are not extracted
@@ -208,7 +216,7 @@ JSON cache of all qualifying assets with full metadata and score breakdowns. Can
 ## Using the Output
 
 ### For question generation / simulation scenarios
-Feed `output/context.txt` directly to an LLM as context. The 12-section structure is designed for this:
+Feed `output/context.txt` directly to an LLM as context. The 13-section structure is designed for this:
 
 ```
 # In your prompt:
