@@ -1,7 +1,7 @@
 """
 context_writer_v2.py
 
-Structured 12-section context output optimized for Rex simulation scenario generation.
+Structured 14-section context output optimized for Rex simulation scenario generation.
 Does NOT modify asset_scorer.py — keeps it as fallback.
 """
 
@@ -222,7 +222,7 @@ MAX_CONDENSED   = 2000    # Next tier → condensed detail (Section 9)
 
 
 def build_context_data(asset_index: dict) -> dict:
-    """Classify, enrich and precompute all data needed by the 12 sections."""
+    """Classify, enrich and precompute all data needed by the 14 sections."""
     _p("\n[Context Writer v2] Precomputing context data...")
     t0 = time.time()
 
@@ -409,6 +409,17 @@ def build_context_data(asset_index: dict) -> dict:
         "tables_with_definition": tables_with_definition,
         "tables_with_announcement": tables_with_announcement,
         "no_medallion": no_medallion,
+        # Operational signal stats (may be 0 if tenant doesn't have these fields)
+        "tables_with_reads": sum(1 for t in tables.values() if (t.get("source_read_count") or 0) > 0),
+        "tables_with_queries": sum(1 for t in tables.values() if (t.get("query_count") or 0) > 0),
+        "tables_with_viewers": sum(1 for t in tables.values()
+                                   if t.get("viewer_users") or t.get("viewer_groups")),
+        "tables_profiled": sum(1 for t in tables.values() if t.get("is_profiled")),
+        "tables_with_sample_data": sum(1 for t in tables.values() if t.get("sample_data_url")),
+        "tables_with_dq": sum(1 for t in tables.values()
+                              if t.get("mc_monitor_statuses") or t.get("mc_monitor_names")
+                              or t.get("dq_failed_count") or t.get("dq_passed_count")
+                              or t.get("soda_status")),
     }
 
 
@@ -1354,12 +1365,144 @@ def write_section_13_sql_intelligence(f, ctx: dict, all_edges: list):
                 f.write(f"... +{len(tool_assets) - 30} more {tool} assets\n\n")
 
 
+def write_section_14_operational_intelligence(f, ctx: dict):
+    """Operational Intelligence — usage, DQ monitoring, access, profiling signals."""
+    _write_section_header(f, 14, "Operational Intelligence")
+
+    tables = ctx["tables"]
+    total = ctx["total_tables"]
+    if total == 0:
+        f.write("No tables available for operational analysis.\n\n")
+        return
+
+    has_any_signal = any([
+        ctx.get("tables_with_reads"), ctx.get("tables_with_queries"),
+        ctx.get("tables_with_viewers"), ctx.get("tables_profiled"),
+        ctx.get("tables_with_dq"), ctx.get("tables_with_sample_data"),
+    ])
+
+    if not has_any_signal:
+        f.write("No operational signal fields found in this tenant's MDLH schema.\n")
+        f.write("Fields attempted: sourceReadCount, queryCount, viewerUsers/Groups, "
+                "isProfiled, sampleDataUrl, assetMcMonitorStatuses.\n")
+        f.write("These fields may not be populated for this tenant.\n\n")
+        return
+
+    # --- Usage Hotspots ---
+    f.write("### Usage Signals\n\n")
+    reads = ctx.get("tables_with_reads", 0)
+    queries = ctx.get("tables_with_queries", 0)
+    f.write(f"- Tables with read activity: **{reads:,}** / {total:,} "
+            f"({reads/total*100:.0f}%)\n")
+    f.write(f"- Tables with query activity: **{queries:,}** / {total:,} "
+            f"({queries/total*100:.0f}%)\n\n")
+
+    # Top 15 most-read tables
+    read_tables = sorted(
+        [(t, t.get("source_read_count", 0)) for t in tables.values()
+         if (t.get("source_read_count") or 0) > 0],
+        key=lambda x: -x[1]
+    )
+    if read_tables:
+        f.write("**Top 15 most-read tables:**\n\n")
+        f.write("| Table | Schema | Reads | Unique Readers | Queries |\n")
+        f.write("|-------|--------|------:|---------------:|--------:|\n")
+        for t, rc in read_tables[:15]:
+            name = t.get("name", "")
+            schema = t.get("schema_name", "")
+            readers = int(t.get("source_read_user_count", 0))
+            qc = int(t.get("query_count", 0))
+            f.write(f"| {name} | {schema} | {int(rc):,} | {readers:,} | {qc:,} |\n")
+        if len(read_tables) > 15:
+            f.write(f"\n*... +{len(read_tables) - 15} more tables with read activity*\n")
+        f.write("\n")
+
+    # Zero-usage tables (for gap analysis)
+    zero_usage = [t for t in tables.values()
+                  if (t.get("source_read_count") or 0) == 0 and (t.get("query_count") or 0) == 0]
+    if reads > 0 and zero_usage:
+        f.write(f"**Zero-usage tables:** {len(zero_usage):,} / {total:,} tables have "
+                f"no recorded reads or queries.\n\n")
+
+    # --- DQ Monitoring ---
+    dq_count = ctx.get("tables_with_dq", 0)
+    f.write("### Data Quality Monitoring\n\n")
+    if dq_count > 0:
+        f.write(f"- Tables with DQ signals: **{dq_count:,}** / {total:,} "
+                f"({dq_count/total*100:.0f}%)\n\n")
+        dq_tables = []
+        for t in tables.values():
+            signals = []
+            if t.get("mc_monitor_statuses"):
+                signals.append(f"status: {str(t['mc_monitor_statuses'])[:100]}")
+            if t.get("mc_monitor_names"):
+                signals.append(f"monitors: {str(t['mc_monitor_names'])[:100]}")
+            if t.get("dq_failed_count"):
+                signals.append(f"failed: {t['dq_failed_count']}")
+            if t.get("dq_passed_count"):
+                signals.append(f"passed: {t['dq_passed_count']}")
+            if t.get("soda_status"):
+                signals.append(f"soda: {t['soda_status']}")
+            if signals:
+                dq_tables.append((t, "; ".join(signals)))
+
+        if dq_tables:
+            f.write("**Sample DQ-monitored tables:**\n\n")
+            for t, info in dq_tables[:15]:
+                name = t.get("name", "")
+                schema = t.get("schema_name", "")
+                f.write(f"- **{name}** ({schema}): {info}\n")
+            if len(dq_tables) > 15:
+                f.write(f"\n*... +{len(dq_tables) - 15} more*\n")
+            f.write("\n")
+    else:
+        f.write("No DQ monitor data found on tables.\n\n")
+
+    # --- Access Patterns ---
+    viewer_count = ctx.get("tables_with_viewers", 0)
+    f.write("### Access Patterns\n\n")
+    if viewer_count > 0:
+        f.write(f"- Tables with explicit viewer lists: **{viewer_count:,}** / {total:,} "
+                f"({viewer_count/total*100:.0f}%)\n\n")
+        viewer_tables = sorted(
+            [(t, len(t.get("viewer_users") or []) + len(t.get("viewer_groups") or []))
+             for t in tables.values()
+             if t.get("viewer_users") or t.get("viewer_groups")],
+            key=lambda x: -x[1]
+        )
+        if viewer_tables:
+            f.write("**Tables with most viewers:**\n\n")
+            f.write("| Table | Schema | Viewer Users | Viewer Groups |\n")
+            f.write("|-------|--------|-------------:|--------------:|\n")
+            for t, _ in viewer_tables[:10]:
+                name = t.get("name", "")
+                schema = t.get("schema_name", "")
+                vu = len(t.get("viewer_users") or [])
+                vg = len(t.get("viewer_groups") or [])
+                f.write(f"| {name} | {schema} | {vu:,} | {vg:,} |\n")
+            f.write("\n")
+    else:
+        f.write("No viewer access data found on tables.\n\n")
+
+    # --- Profiling ---
+    profiled = ctx.get("tables_profiled", 0)
+    sampled = ctx.get("tables_with_sample_data", 0)
+    f.write("### Profiling & Sample Data\n\n")
+    if profiled > 0 or sampled > 0:
+        f.write(f"- Profiled tables: **{profiled:,}** / {total:,} "
+                f"({profiled/total*100:.0f}%)\n")
+        f.write(f"- Tables with sample data URL: **{sampled:,}** / {total:,} "
+                f"({sampled/total*100:.0f}%)\n\n")
+    else:
+        f.write("No profiling or sample data metadata found on tables.\n\n")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path, all_edges: list = None):
-    """Build and write the 13-section structured context file."""
+    """Build and write the 14-section structured context file."""
     _p(f"\n{'='*60}")
     _p("[Context Writer v2] Building structured context...")
     _p(f"{'='*60}")
@@ -1383,7 +1526,7 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path, all_
     with open(context_path, "w") as f:
         f.write(f"# Structured Asset Context — {tenant}\n")
         f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"# Format: Context Writer v2.1 (13 sections)\n\n")
+        f.write(f"# Format: Context Writer v2.2 (14 sections)\n\n")
 
         write_section_1_header(f, ctx, tenant)
         write_section_2_glossary(f, ctx)
@@ -1398,6 +1541,7 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path, all_
         write_section_11_gaps(f, ctx)
         write_section_12_custom_entities(f, ctx)
         write_section_13_sql_intelligence(f, ctx, edge_dicts)
+        write_section_14_operational_intelligence(f, ctx)
 
     # --- Output validation ---
     _p("\n  Validating output...")
@@ -1410,7 +1554,7 @@ def run_context_writer_v2(asset_index: dict, tenant: str, output_dir: Path, all_
 
     elapsed = time.time() - t0
     _p(f"  Context written: {context_path}")
-    _p(f"  Sections: 13 | Tables: {ctx['total_tables']:,} | "
+    _p(f"  Sections: 14 | Tables: {ctx['total_tables']:,} | "
        f"Custom Entities: {len(ctx['custom_entities']):,} | Time: {elapsed:.1f}s")
     return context_path
 
@@ -1423,8 +1567,8 @@ def validate_context_output(context_path: Path) -> list:
     except Exception as e:
         return [f"Cannot read output file: {e}"]
 
-    # Check all 13 sections exist
-    for i in range(1, 14):
+    # Check all 14 sections exist
+    for i in range(1, 15):
         marker = f"## Section {i}:"
         if marker not in content:
             issues.append(f"Missing {marker} in output")

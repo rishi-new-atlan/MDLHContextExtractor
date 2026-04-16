@@ -59,6 +59,22 @@ class AssetDetail:
     transform_compiled_sql: str = ""
     transform_materialization_type: str = ""
     transform_tool: str = ""          # "dbt", "matillion", "adf", etc.
+    # --- operational signals (lightweight probes — may not exist in all tenants) ---
+    source_read_count: float = 0.0
+    source_read_user_count: float = 0.0
+    query_count: float = 0.0
+    viewer_users: list = field(default_factory=list)
+    viewer_groups: list = field(default_factory=list)
+    is_profiled: bool = False
+    sample_data_url: str = ""
+    mc_monitor_statuses: str = ""     # raw DQ monitor status string
+    mc_monitor_names: str = ""        # monitor names
+    mc_incident_count: int = 0
+    mc_monitor_types: str = ""
+    dq_failed_count: int = 0
+    dq_passed_count: int = 0
+    soda_status: str = ""
+    source_read_recent_users: str = ""  # recent reader list
 
 
 @dataclass
@@ -142,6 +158,7 @@ _PREFIX_CASING = [
     ("saperp", "SapERP"),
     ("domo", "Domo"),
     ("qlik", "Qlik"),
+    ("model", "Model"),
     ("mode", "Mode"),
     ("adls", "ADLS"),
     ("soda", "Soda"),
@@ -237,25 +254,26 @@ def _probe_fields(tbl, desired_fields):
     """Return the subset of desired_fields that actually exist in the table schema.
 
     This prevents scan failures when MDLH schema doesn't have a field we expect.
-    Comparison is case-insensitive.
+    Comparison is case-insensitive. Returns the actual schema-cased field names
+    so pyiceberg can resolve them. Returns (safe_fields, dropped_fields).
     """
     try:
         schema = tbl.schema()
-        available = {f.name.lower() for f in schema.fields}
-        probed = tuple(f for f in desired_fields if f.lower() in available)
-        dropped = set(f.lower() for f in desired_fields) - set(f.lower() for f in probed)
-        if dropped:
-            _p(f"    [probe] fields not in schema, skipped: {sorted(dropped)}")
-        return probed
+        # Map lowercase → actual schema field name (preserves original case)
+        available = {f.name.lower(): f.name for f in schema.fields}
+        probed = tuple(available[f.lower()] for f in desired_fields if f.lower() in available)
+        dropped = frozenset(f.lower() for f in desired_fields) - frozenset(f.lower() for f in probed)
+        return probed, dropped
     except Exception:
-        # If schema introspection fails, return all and let scan handle it
-        return desired_fields
+        return desired_fields, frozenset()
 
 
 def _safe_scan_all(catalog, namespace, table_name, selected_fields):
     try:
         tbl = _load_table_ci(catalog, namespace, table_name)
-        scan = tbl.scan(selected_fields=selected_fields)
+        # Use _probe_fields to resolve correct casing
+        safe, _ = _probe_fields(tbl, selected_fields)
+        scan = tbl.scan(selected_fields=safe)
         df = scan.to_pandas()
         return _normalize_columns(df)
     except Exception as e:
@@ -312,6 +330,19 @@ def _to_float(val):
         return 0.0
 
 
+def _to_bool(val):
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    try:
+        return bool(val)
+    except (TypeError, ValueError):
+        return False
+
+
 def _to_int(val):
     if val is None:
         return 0
@@ -344,6 +375,9 @@ SKIP_PREFIXES = (
     "workflow",     # Atlan workflow system
     "authpolicy",   # access control internals
     "authservice",  # access control internals
+    "atlanapp",     # Atlan platform apps
+    "appworkflow",  # Atlan workflow runs
+    "assetgrouping",  # Atlan internal asset grouping
 )
 
 # Shared extra-field tuples for category definitions
@@ -370,6 +404,24 @@ _TRANSFORM_EXTRA = (
     "ownerusers", "certificatestatus", "assetaigenerateddescription",
 )
 
+# Operational signal fields — probed on core tables/views/matviews only.
+# These may not exist in all tenants; _probe_fields safely skips missing ones.
+_OPERATIONAL_PROBE = (
+    # Usage
+    "sourcereadcount", "sourcereadusercount", "querycount",
+    "sourcereadrecentuserrecordlist",
+    # Access
+    "viewerusers", "viewergroups",
+    "assetviewerusers", "assetviewergroups",
+    # Profiling
+    "isprofiled", "sampledataurl",
+    # DQ (try multiple naming conventions)
+    "assetmcmonitorstatuses", "assetmcmonitornames",
+    "assetmcincidentcount", "assetmcmonitortypes",
+    "assetdqfailedcount", "assetdqpassedcount",
+    "assetsodasqlanalyzerstatus",
+)
+
 # Category definitions — order matters: specific before general (first match wins)
 ENTITY_CATEGORIES = {
     # --- Core relational ---
@@ -377,18 +429,21 @@ ENTITY_CATEGORIES = {
         "exact": ["table"],
         "prefixes": [],
         "extra_fields": _CORE_EXTRA + ("tabledefinition", "rowcount", "sizebytes"),
+        "probe_extra": _OPERATIONAL_PROBE,
         "label_map": {"table": "Table"},
     },
     "core_view": {
         "exact": ["view"],
         "prefixes": [],
         "extra_fields": _CORE_EXTRA + ("definition",),
+        "probe_extra": _OPERATIONAL_PROBE,
         "label_map": {"view": "View"},
     },
     "core_matview": {
         "exact": ["materialisedview"],
         "prefixes": [],
         "extra_fields": _CORE_EXTRA + ("definition", "refreshmethod", "refreshmode", "staleness"),
+        "probe_extra": _OPERATIONAL_PROBE,
         "label_map": {"materialisedview": "MaterialisedView"},
     },
     "core_column": {
@@ -405,7 +460,7 @@ ENTITY_CATEGORIES = {
         "exact": ["glossaryterm", "glossarycategory"],
         "prefixes": [],
         "extra_fields": (
-            "shortdescription", "longdescription",
+            "shortdescription", "longdescription", "userdescription",
             "assetaigenerateddescription", "ownerusers", "ownergroups",
             "certificatestatus",
         ),
@@ -464,6 +519,18 @@ ENTITY_CATEGORIES = {
         "prefixes": ["semantic", "snowflakesemantic"],
         "extra_fields": _LIGHT_EXTRA,
         "label_map": {"dbtsemanticmodel": "DbtSemanticModel"},
+    },
+    # --- Data Modeling (before BI — "model" would incorrectly match "mode" prefix) ---
+    "data_model": {
+        "exact": [],
+        "prefixes": ["model"],
+        "extra_fields": _LIGHT_EXTRA,
+    },
+    # --- API assets ---
+    "api": {
+        "exact": [],
+        "prefixes": ["api"],
+        "extra_fields": _LIGHT_EXTRA,
     },
     # --- BI tools ---
     "bi": {
@@ -555,6 +622,24 @@ FIELD_ALIASES = {
     "dbtrawsql": "transform_raw_sql",
     "dbtcompiledsql": "transform_compiled_sql",
     "dbtmaterializationtype": "transform_materialization_type",
+    # operational signals
+    "sourcereadcount": "source_read_count",
+    "sourcereadusercount": "source_read_user_count",
+    "querycount": "query_count",
+    "viewerusers": "viewer_users",
+    "viewergroups": "viewer_groups",
+    "isprofiled": "is_profiled",
+    "sampledataurl": "sample_data_url",
+    "assetmcmonitorstatuses": "mc_monitor_statuses",
+    "assetmcmonitornames": "mc_monitor_names",
+    "assetmcincidentcount": "mc_incident_count",
+    "assetmcmonitortypes": "mc_monitor_types",
+    "assetdqfailedcount": "dq_failed_count",
+    "assetdqpassedcount": "dq_passed_count",
+    "assetsodasqlanalyzerstatus": "soda_status",
+    "sourcereadrecentuserrecordlist": "source_read_recent_users",
+    "assetviewerusers": "viewer_users",    # alternate name
+    "assetviewergroups": "viewer_groups",  # alternate name
 }
 
 # Fields that need type conversion (field name → converter)
@@ -564,6 +649,16 @@ FIELD_CONVERTERS = {
     "popularity_score": _to_float,
     "row_count": _to_int,
     "size_bytes": _to_int,
+    # operational signals
+    "source_read_count": _to_float,
+    "source_read_user_count": _to_float,
+    "query_count": _to_float,
+    "viewer_users": _to_list,
+    "viewer_groups": _to_list,
+    "is_profiled": _to_bool,
+    "mc_incident_count": _to_int,
+    "dq_failed_count": _to_int,
+    "dq_passed_count": _to_int,
 }
 
 
@@ -630,9 +725,7 @@ def discover_and_categorize(catalog, ns):
                f"{', '.join(categorized[cat_name][:8])}"
                f"{'...' if len(categorized[cat_name]) > 8 else ''}")
     if uncategorized:
-        _p(f"    uncategorized: {', '.join(sorted(uncategorized)[:20])}")
-        if len(uncategorized) > 20:
-            _p(f"      ... +{len(uncategorized) - 20} more")
+        _p(f"    uncategorized ({len(uncategorized)}): {', '.join(sorted(uncategorized))}")
 
     return dict(categorized), skipped, uncategorized
 
@@ -669,10 +762,18 @@ def _row_to_asset(row, asset_type, safe_fields, cat_def, table_name=""):
 
         setattr(detail, field_name, val)
 
-    # Glossary post-processing: description ← shortdescription, readme ← longdescription
+    # Glossary post-processing: cascade description sources, longdescription as readme
+    # Priority: shortDescription > userDescription > description (base field)
     if cat_def.get("post_process") == "glossary":
-        detail.description = _to_str(row.get("shortdescription", ""))
-        detail.readme = _to_str(row.get("longdescription", ""))
+        short = _to_str(row.get("shortdescription", ""))
+        user_desc = _to_str(row.get("userdescription", ""))
+        if short:
+            detail.description = short
+        elif user_desc:
+            detail.description = user_desc
+        long = _to_str(row.get("longdescription", ""))
+        if long:
+            detail.readme = long
 
     # Transform tool detection from table name prefix
     for prefix in ENTITY_CATEGORIES.get("transform", {}).get("prefixes", []):
@@ -706,6 +807,7 @@ def build_asset_index(catalog, ns):
         cat_def = ENTITY_CATEGORIES[cat_name]
         _p(f"  Scanning {cat_name} ({len(table_names)} tables)...")
         cat_count = 0
+        cat_dropped = set()  # collect dropped fields across all tables in category
 
         for table_name in table_names:
             # Determine asset_type from label_map or use table_name directly
@@ -715,7 +817,8 @@ def build_asset_index(catalog, ns):
             try:
                 tbl = _load_table_ci(catalog, ns, table_name)
                 desired = BASE_FIELDS + cat_def["extra_fields"] + cat_def.get("probe_extra", ())
-                safe = _probe_fields(tbl, desired)
+                safe, dropped = _probe_fields(tbl, desired)
+                cat_dropped.update(dropped)
                 scan = tbl.scan(row_filter="status == 'ACTIVE'", selected_fields=safe)
                 df = _normalize_columns(scan.to_pandas())
             except Exception as e:
@@ -728,6 +831,8 @@ def build_asset_index(catalog, ns):
                     asset_index[detail.guid] = detail
                     cat_count += 1
 
+        if cat_dropped:
+            _p(f"    [probe] {cat_name}: fields not in schema: {sorted(cat_dropped)}")
         _p(f"    {cat_name}: {cat_count:,} loaded (total so far: {len(asset_index):,})")
 
     discovery_report = {
@@ -751,7 +856,9 @@ def pull_asset_readmes(catalog, ns, asset_index):
     attached = 0
     try:
         tbl = _load_table_ci(catalog, ns, "readme")
-        scan = tbl.scan(selected_fields=("guid", "qualifiedname", "asset", "description"))
+        desired = ("guid", "qualifiedname", "asset", "description")
+        safe, _ = _probe_fields(tbl, desired)
+        scan = tbl.scan(selected_fields=safe)
         df = _normalize_columns(scan.to_pandas())
         _p(f"  {len(df):,} README rows found")
     except Exception as e:
@@ -907,7 +1014,9 @@ def build_lineage_edges(catalog, ns, asset_index):
         try:
             tbl = _load_table_ci(catalog, ns, process_type)
             desired = ("guid", "name", "qualifiedname", "inputs", "outputs", "sql", "code")
-            safe_fields = _probe_fields(tbl, desired)
+            safe_fields, dropped = _probe_fields(tbl, desired)
+            if dropped:
+                _p(f"    [probe] {process_type}: fields not in schema: {sorted(dropped)}")
             scan = tbl.scan(selected_fields=safe_fields)
             df = _normalize_columns(scan.to_pandas())
             _p(f"  {process_type}: {len(df):,} rows to process")
@@ -1187,6 +1296,18 @@ def extract_metadata(catalog, ns, tenant):
     }
     _p(f"  v2 field coverage:")
     for k, v in v2_stats.items():
+        _p(f"    {k}: {v:,}")
+
+    ops_stats = {
+        "tables_with_reads": sum(1 for a in asset_index.values() if a.source_read_count > 0),
+        "tables_with_queries": sum(1 for a in asset_index.values() if a.query_count > 0),
+        "tables_with_viewers": sum(1 for a in asset_index.values() if a.viewer_users or a.viewer_groups),
+        "tables_profiled": sum(1 for a in asset_index.values() if a.is_profiled),
+        "tables_with_dq": sum(1 for a in asset_index.values()
+                              if a.mc_monitor_statuses or a.mc_monitor_names or a.dq_failed_count or a.dq_passed_count or a.soda_status),
+    }
+    _p(f"  operational signals:")
+    for k, v in ops_stats.items():
         _p(f"    {k}: {v:,}")
 
     # Discovery report summary

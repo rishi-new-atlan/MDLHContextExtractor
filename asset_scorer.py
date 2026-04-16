@@ -43,6 +43,11 @@ WEIGHTS = {
     "announcement":              1,   # active announcement on asset
     "popularity":                1,   # non-zero popularity score
     "owner":                     1,   # has assigned owner (user or group)
+    # operational signals
+    "usage":                     2,   # has read or query activity
+    "dq_monitored":              2,   # has DQ monitors attached
+    "has_viewers":               1,   # has explicit viewer access lists
+    "is_profiled":               1,   # table has been profiled
 }
 
 ALWAYS_INCLUDE_TYPES = {"GlossaryTerm", "DataProduct", "DataDomain", "CustomEntity"}
@@ -83,6 +88,11 @@ def score_asset(asset: dict) -> tuple:
         "announcement":         WEIGHTS["announcement"]         if asset.get("announcement_type") else 0,
         "popularity":           WEIGHTS["popularity"]           if (asset.get("popularity_score") or 0) > 0 else 0,
         "owner":                WEIGHTS["owner"]                if (asset.get("owner_users") or asset.get("owner_groups")) else 0,
+        # operational signals
+        "usage":                WEIGHTS["usage"]                if ((asset.get("source_read_count") or 0) > 0 or (asset.get("query_count") or 0) > 0) else 0,
+        "dq_monitored":         WEIGHTS["dq_monitored"]         if (asset.get("mc_monitor_statuses") or asset.get("mc_monitor_names") or asset.get("dq_failed_count") or asset.get("dq_passed_count") or asset.get("soda_status")) else 0,
+        "has_viewers":          WEIGHTS["has_viewers"]           if (asset.get("viewer_users") or asset.get("viewer_groups")) else 0,
+        "is_profiled":          WEIGHTS["is_profiled"]           if asset.get("is_profiled") else 0,
     }
     return sum(breakdown.values()), breakdown
 
@@ -137,6 +147,14 @@ def _fmt_asset_block(asset: dict, score: int) -> str:
 
     if asset.get("owner_users"):
         lines.append(f"Owners: {', '.join(asset['owner_users'])}")
+
+    # Operational signals
+    reads = asset.get("source_read_count") or 0
+    queries = asset.get("query_count") or 0
+    if reads > 0 or queries > 0:
+        lines.append(f"Usage: {int(reads):,} reads, {int(queries):,} queries")
+    if asset.get("mc_monitor_statuses"):
+        lines.append(f"DQ Monitors: {asset['mc_monitor_statuses']}")
 
     lines.append(f"Score: {score}")
     lines.append("---")
